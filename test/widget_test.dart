@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gartentor/main.dart'; // <- Adjust the import path to your project
 
 void main() {
-  Future<void> _loginAs(
+  Future<void> loginAs(
     WidgetTester tester, {
     required String user,
     required String pass,
@@ -28,7 +28,7 @@ void main() {
 
   testWidgets('Login als admin zeigt Dashboard mit Admin-Tab',
       (WidgetTester tester) async {
-    await _loginAs(tester, user: 'admin', pass: 'admin');
+    await loginAs(tester, user: 'admin', pass: 'admin');
 
     // Dashboard visible
     expect(find.text('BAVRKA – Intelligentes Gartentor'), findsOneWidget);
@@ -42,7 +42,7 @@ void main() {
 
   testWidgets('Anfrage simulieren -> im Protokoll als "opened"/"denied" sichtbar',
       (WidgetTester tester) async {
-    await _loginAs(tester, user: 'admin', pass: 'admin');
+    await loginAs(tester, user: 'admin', pass: 'admin');
 
     // Simulate an access request (FAB)
     final fab = find.byType(FloatingActionButton);
@@ -69,7 +69,7 @@ void main() {
 
   testWidgets('Kennzeichen hinzufügen (permanent) erscheint in der Liste',
       (WidgetTester tester) async {
-    await _loginAs(tester, user: 'admin', pass: 'admin');
+    await loginAs(tester, user: 'admin', pass: 'admin');
 
     // Switch to "Kennzeichen" tab
     await tester.tap(find.text('Kennzeichen'));
@@ -92,7 +92,7 @@ void main() {
   });
 
   testWidgets('Logout bringt zurück zum Login', (WidgetTester tester) async {
-    await _loginAs(tester, user: 'admin', pass: 'admin');
+    await loginAs(tester, user: 'admin', pass: 'admin');
 
     // Logout icon in AppBar
     await tester.tap(find.byIcon(Icons.logout));
