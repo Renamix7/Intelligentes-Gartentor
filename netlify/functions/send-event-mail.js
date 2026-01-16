@@ -26,7 +26,18 @@ export async function handler(event) {
     const plate = record.plate ?? "-";
     const action = record.action ?? "-";
     const by = record.by_user ?? "-";
-    const time = record.time ?? new Date().toISOString();
+    const rawTime = record.time ?? new Date().toISOString();
+	const d = new Date(rawTime);
+
+	const time = new Intl.DateTimeFormat("de-AT", {
+	timeZone: "Europe/Vienna",
+	year: "numeric",
+	month: "2-digit",
+	day: "2-digit",
+	hour: "2-digit",
+	minute: "2-digit",
+	}).format(d);
+
 
     console.log("Sending email to:", process.env.ADMIN_EMAIL);
     console.log("Event:", { plate, action, by, time });

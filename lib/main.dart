@@ -7,6 +7,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 // BAVRKA - Intelligentes Gartentor - main
 // flutter run -d chrome
+//git add .
+//git commit -m "update"
+//git push
 
 // ========================= HELPERS =========================
 
