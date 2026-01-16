@@ -11,7 +11,7 @@ void main() {
     await tester.pumpWidget(const GateApp());
 
     // Login screen visible
-    expect(find.text('BAVRKA Login'), findsOneWidget);
+    expect(find.text('Login'), findsOneWidget);
 
     // Fill in fields
     await tester.enterText(
@@ -31,7 +31,7 @@ void main() {
     await loginAs(tester, user: 'admin', pass: 'admin');
 
     // Dashboard visible
-    expect(find.text('BAVRKA – Intelligentes Gartentor'), findsOneWidget);
+    expect(find.text(' Intelligentes Gartentor'), findsOneWidget);
 
     // Tabs available
     expect(find.text('Anfragen'), findsOneWidget);
@@ -98,6 +98,6 @@ void main() {
     await tester.tap(find.byIcon(Icons.logout));
     await tester.pumpAndSettle();
 
-    expect(find.text('BAVRKA Login'), findsOneWidget);
+    expect(find.text('Login'), findsOneWidget);
   });
 }
