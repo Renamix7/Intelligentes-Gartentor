@@ -241,7 +241,7 @@ class AppState extends ChangeNotifier {
   // IMPORTANT: Flutter Web needs WebSocket. Your Mosquitto add-on shows WS on 1884.
   // Replace HA_IP with your Home Assistant IP (or Tailscale IP).
   static const String mqttWsUrl = 'ws://100.95.51.36:1884'; // <-- CHANGE THIS
-  static const String mqttUser = 'webrob'; // <-- CHANGE THIS
+  static const String mqttUser = 'homeassistant'; // <-- CHANGE THIS
   static const String mqttPass = '__123456789'; // <-- CHANGE THIS
 
   MqttService? _mqtt;
