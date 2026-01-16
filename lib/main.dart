@@ -1,9 +1,15 @@
 // ignore_for_file: prefer_const_constructors
 
 import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' as sb;
 import 'package:shared_preferences/shared_preferences.dart';
+
+// MQTT (Flutter Web via WebSocket)
+import 'package:mqtt_client/mqtt_browser_client.dart';
+import 'package:mqtt_client/mqtt_client.dart';
 
 // BAVRKA - Intelligentes Gartentor - main
 // flutter run -d chrome
@@ -53,6 +59,84 @@ bool _looksLikePlate(String input) {
   if (s.length >= 9 && (digits <= 1 || letters <= 1)) return false;
 
   return true;
+}
+
+// ========================= MQTT SERVICE (INLINE) =========================
+
+class MqttService {
+  final String wsUrl; // e.g. "ws://192.168.1.50:1884"
+  final String username;
+  final String password;
+
+  late final MqttBrowserClient client;
+
+  MqttService({
+    required this.wsUrl,
+    required this.username,
+    required this.password,
+  }) {
+    client = MqttBrowserClient(
+      wsUrl,
+      'flutter_web_${DateTime.now().millisecondsSinceEpoch}',
+    );
+    client.keepAlivePeriod = 20;
+    client.logging(on: false);
+  }
+
+  Future<void> connect() async {
+    client.connectionMessage = MqttConnectMessage()
+        .withClientIdentifier(client.clientIdentifier)
+        .authenticateAs(username, password)
+        .startClean()
+        .withWillQos(MqttQos.atMostOnce);
+
+    try {
+      await client.connect();
+    } catch (e) {
+      client.disconnect();
+      rethrow;
+    }
+
+    if (client.connectionStatus?.state != MqttConnectionState.connected) {
+      throw Exception('MQTT not connected: ${client.connectionStatus}');
+    }
+  }
+
+  void subscribe(String topic) {
+    client.subscribe(topic, MqttQos.atMostOnce);
+  }
+
+  Stream<Map<String, dynamic>> messages() {
+    final updates = client.updates;
+    if (updates == null) return const Stream.empty();
+
+    return updates.expand((events) => events).map((event) {
+      final rec = event.payload as MqttPublishMessage;
+      final payload = MqttPublishPayload.bytesToStringAsString(
+        rec.payload.message,
+      );
+
+      Map<String, dynamic>? json;
+      try {
+        final decoded = jsonDecode(payload);
+        if (decoded is Map<String, dynamic>) json = decoded;
+      } catch (_) {}
+
+      return {
+        'topic': event.topic,
+        'payload': payload,
+        'json': json,
+      };
+    });
+  }
+
+  void publishJson(String topic, Map<String, dynamic> data) {
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(jsonEncode(data));
+    client.publishMessage(topic, MqttQos.atMostOnce, builder.payload!);
+  }
+
+  void disconnect() => client.disconnect();
 }
 
 // ========================= MAIN =========================
@@ -120,11 +204,12 @@ class AccessEvent {
   final String plate;
   final String action;
   final String by;
-  AccessEvent(
-      {required this.time,
-      required this.plate,
-      required this.action,
-      required this.by});
+  AccessEvent({
+    required this.time,
+    required this.plate,
+    required this.action,
+    required this.by,
+  });
 }
 
 class AccessRequest {
@@ -152,10 +237,67 @@ class AppState extends ChangeNotifier {
 
   Timer? _refreshTimer;
 
+  // ================= MQTT CONFIG =================
+  // IMPORTANT: Flutter Web needs WebSocket. Your Mosquitto add-on shows WS on 1884.
+  // Replace HA_IP with your Home Assistant IP (or Tailscale IP).
+  static const String mqttWsUrl = 'ws://100.95.51.36:1884'; // <-- CHANGE THIS
+  static const String mqttUser = 'webrob'; // <-- CHANGE THIS
+  static const String mqttPass = '__123456789'; // <-- CHANGE THIS
+
+  MqttService? _mqtt;
+  StreamSubscription? _mqttSub;
+
+  Future<void> startMqtt() async {
+    if (_mqtt != null) return;
+
+    final svc = MqttService(
+      wsUrl: mqttWsUrl,
+      username: mqttUser,
+      password: mqttPass,
+    );
+
+    await svc.connect();
+
+    // Listen for unknown plate requests coming from HA:
+    svc.subscribe('gartentor/requests');
+
+    _mqttSub = svc.messages().listen((msg) {
+      if (msg['topic'] != 'gartentor/requests') return;
+
+      final j = msg['json'];
+      if (j == null) return;
+
+      if (j['cmd'] == 'REQUEST') {
+        final plate = (j['plate'] ?? '').toString();
+        if (plate.isEmpty) return;
+
+        final req = AccessRequest(
+          id: 'mqtt_${DateTime.now().millisecondsSinceEpoch}',
+          time: DateTime.now(),
+          plate: plate,
+        );
+
+        requests.insert(0, req);
+        _requestStream.add(req);
+        notifyListeners();
+      }
+    });
+
+    _mqtt = svc;
+  }
+
+  void stopMqtt() {
+    _mqttSub?.cancel();
+    _mqttSub = null;
+    _mqtt?.disconnect();
+    _mqtt = null;
+  }
+
+  // =================================================
+
   void startAutoRefresh() {
     _refreshTimer?.cancel();
     _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
-      // Lightweight: plates cleanup + latest requests/events
       await Future.wait([
         loadPlates(),
         loadRequests(),
@@ -176,6 +318,14 @@ class AppState extends ChangeNotifier {
       currentUser = const AppUser('admin', isAdmin: true);
       await loadAll();
       startAutoRefresh();
+
+      // Start MQTT (so website can receive HA pings immediately)
+      try {
+        await startMqtt();
+      } catch (_) {
+        // keep app usable even if mqtt fails; can still poll supabase requests
+      }
+
       notifyListeners();
     }
     return ok;
@@ -183,6 +333,7 @@ class AppState extends ChangeNotifier {
 
   void logout() {
     stopAutoRefresh();
+    stopMqtt();
     currentUser = null;
     notifyListeners();
   }
@@ -226,14 +377,6 @@ class AppState extends ChangeNotifier {
     if (expiredNumbers.isNotEmpty) {
       final filter = expiredNumbers.map((n) => 'number.eq.$n').join(',');
       await supabase.from('plates').delete().or(filter);
-
-
-      // optional: log it
-      // await supabase.from('access_events').insert(expiredNumbers.map((n) => {
-      //       'plate': n,
-      //       'action': 'plate_expired_removed',
-      //       'by_user': 'system',
-      //     }).toList());
     }
 
     plates
@@ -389,35 +532,75 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> approveRequest(AccessRequest req, {required String by}) async {
+    // 1) MQTT: open gate immediately
+    _mqtt?.publishJson('gartentor/cmd', {
+      'cmd': 'OPEN',
+      'plate': req.plate,
+      'by': by,
+      'ts': DateTime.now().toIso8601String(),
+    });
+
+    // 2) Log event
     await supabase.from('access_events').insert({
       'plate': req.plate,
       'action': 'opened',
       'by_user': by,
     });
 
-    final idInt = int.tryParse(req.id);
-    await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
+    // 3) Delete request (only if it came from DB)
+    if (!req.id.startsWith('mqtt_')) {
+      final idInt = int.tryParse(req.id);
+      await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
+    }
 
+    // 4) Refresh UI
+    requests.removeWhere((r) => r.id == req.id);
     await loadEvents();
     await loadRequests();
+    notifyListeners();
   }
 
   Future<void> denyRequest(AccessRequest req, {required String by}) async {
+    // 1) MQTT: keep closed / close
+    _mqtt?.publishJson('gartentor/cmd', {
+      'cmd': 'CLOSE',
+      'plate': req.plate,
+      'by': by,
+      'ts': DateTime.now().toIso8601String(),
+    });
+
+    // 2) Log event
     await supabase.from('access_events').insert({
       'plate': req.plate,
       'action': 'denied',
       'by_user': by,
     });
 
-    final idInt = int.tryParse(req.id);
-    await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
+    // 3) Delete request (only if it came from DB)
+    if (!req.id.startsWith('mqtt_')) {
+      final idInt = int.tryParse(req.id);
+      await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
+    }
 
+    // 4) Refresh UI
+    requests.removeWhere((r) => r.id == req.id);
     await loadEvents();
     await loadRequests();
+    notifyListeners();
   }
 
   // Gate command: writes to gate_commands + logs to access_events
+  // + publishes MQTT so the servo reacts immediately
   Future<void> sendGateCommand(String command, {required String by}) async {
+    // MQTT first (instant)
+    _mqtt?.publishJson('gartentor/cmd', {
+      'cmd': command.toLowerCase() == 'open' ? 'OPEN' : 'CLOSE',
+      'plate': 'ADMIN',
+      'by': by,
+      'ts': DateTime.now().toIso8601String(),
+    });
+
+    // DB command log (optional)
     await supabase.from('gate_commands').insert({
       'command': command, // "open" / "close"
       'by_user': by,
@@ -437,6 +620,7 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     stopAutoRefresh();
+    stopMqtt();
     _requestStream.close();
     super.dispose();
   }
@@ -1292,7 +1476,6 @@ class AdminTab extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 14),
-
             Wrap(
               spacing: 10,
               runSpacing: 10,
@@ -1327,15 +1510,12 @@ class AdminTab extends StatelessWidget {
                 ),
               ],
             ),
-
             const SizedBox(height: 18),
-
             Text(
               'Letzte Kennzeichen',
               style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
             ),
             const SizedBox(height: 10),
-
             Card(
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(14),
