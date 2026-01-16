@@ -7,9 +7,11 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' as sb;
 import 'package:shared_preferences/shared_preferences.dart';
 
-// MQTT (Flutter Web via WebSocket)
-import 'package:mqtt_client/mqtt_browser_client.dart';
-import 'package:mqtt_client/mqtt_client.dart';
+// BAVRKA - Intelligentes Gartentor - main
+// flutter run -d chrome
+// git add .
+// git commit -m "update"
+// git push
 
 // ========================= HELPERS =========================
 
@@ -46,88 +48,13 @@ bool _looksLikePlate(String input) {
   final letters = RegExp(r'[A-Z]').allMatches(s).length;
   final digits = RegExp(r'\d').allMatches(s).length;
 
+  // avoid "1284128412" style (too many digits)
   if (digits > 6) return false;
+
+  // avoid 9-10 chars with almost only letters or only 1 digit etc.
   if (s.length >= 9 && (digits <= 1 || letters <= 1)) return false;
 
   return true;
-}
-
-// ========================= MQTT SERVICE (INLINE) =========================
-
-class MqttService {
-  final String wsUrl; // e.g. "ws://100.95.51.36:1884"
-  final String username;
-  final String password;
-
-  late final MqttBrowserClient client;
-
-  MqttService({
-    required this.wsUrl,
-    required this.username,
-    required this.password,
-  }) {
-    client = MqttBrowserClient(
-      wsUrl,
-      'flutter_web_${DateTime.now().millisecondsSinceEpoch}',
-    );
-    client.keepAlivePeriod = 20;
-    client.logging(on: false);
-  }
-
-  Future<void> connect() async {
-    client.connectionMessage = MqttConnectMessage()
-        .withClientIdentifier(client.clientIdentifier)
-        .authenticateAs(username, password)
-        .startClean()
-        .withWillQos(MqttQos.atMostOnce);
-
-    try {
-      await client.connect();
-    } catch (e) {
-      client.disconnect();
-      rethrow;
-    }
-
-    if (client.connectionStatus?.state != MqttConnectionState.connected) {
-      throw Exception('MQTT not connected: ${client.connectionStatus}');
-    }
-  }
-
-  void subscribe(String topic) {
-    client.subscribe(topic, MqttQos.atMostOnce);
-  }
-
-  Stream<Map<String, dynamic>> messages() {
-    final updates = client.updates;
-    if (updates == null) return const Stream.empty();
-
-    return updates.expand((events) => events).map((event) {
-      final rec = event.payload as MqttPublishMessage;
-      final payload = MqttPublishPayload.bytesToStringAsString(
-        rec.payload.message,
-      );
-
-      Map<String, dynamic>? json;
-      try {
-        final decoded = jsonDecode(payload);
-        if (decoded is Map<String, dynamic>) json = decoded;
-      } catch (_) {}
-
-      return {
-        'topic': event.topic,
-        'payload': payload,
-        'json': json,
-      };
-    });
-  }
-
-  void publishJson(String topic, Map<String, dynamic> data) {
-    final builder = MqttClientPayloadBuilder();
-    builder.addString(jsonEncode(data));
-    client.publishMessage(topic, MqttQos.atMostOnce, builder.payload!);
-  }
-
-  void disconnect() => client.disconnect();
 }
 
 // ========================= MAIN =========================
@@ -210,7 +137,7 @@ class AccessRequest {
   AccessRequest({required this.id, required this.time, required this.plate});
 }
 
-// ========================= APP STATE =========================
+// ========================= APP STATE (Supabase Realtime) =========================
 
 class AppState extends ChangeNotifier {
   final sb.SupabaseClient supabase = sb.Supabase.instance.client;
@@ -219,8 +146,6 @@ class AppState extends ChangeNotifier {
 
   final List<Plate> plates = [];
   final List<AccessEvent> events = [];
-
-  // DB Requests (optional/polling) + MQTT Requests (live)
   final List<AccessRequest> requests = [];
 
   final StreamController<AccessRequest> _requestStream =
@@ -230,74 +155,73 @@ class AppState extends ChangeNotifier {
 
   Timer? _refreshTimer;
 
-  // ================= MQTT CONFIG =================
-  // Flutter Web needs WebSocket. Mosquitto add-on shows WS on 1884.
-  static const String mqttWsUrl = 'ws://100.95.51.36:1884';
-  static const String mqttUser = 'homeassistant';
-  static const String mqttPass = '__123456789';
+  // ===================== SUPABASE REALTIME =====================
+  sb.RealtimeChannel? _reqChannel;
+  bool _realtimeStarted = false;
 
-  static const String topicRequests = 'gartentor/requests';
-  static const String topicCmd = 'gartentor/cmd';
+  Future<void> startRequestsRealtime() async {
+    if (_realtimeStarted) return;
+    _realtimeStarted = true;
 
-  MqttService? _mqtt;
-  StreamSubscription? _mqttSub;
+    _reqChannel = supabase.channel('realtime:access_requests');
 
-  Future<void> startMqtt() async {
-    if (_mqtt != null) return;
+    _reqChannel!
+        .onPostgresChanges(
+          event: sb.PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'access_requests',
+          callback: (payload) {
+            final row = payload.newRecord;
+            if (row.isEmpty) return;
 
-    final svc = MqttService(
-      wsUrl: mqttWsUrl,
-      username: mqttUser,
-      password: mqttPass,
-    );
+            final id = row['id'].toString();
+            final plate = (row['plate'] ?? '').toString();
+            final rt = row['request_time'];
 
-    await svc.connect();
+            if (plate.isEmpty || rt == null) return;
 
-    // Subscribe to HA -> Website requests
-    svc.subscribe(topicRequests);
+            final time = DateTime.parse(rt.toString());
+            final req = AccessRequest(id: id, time: time, plate: plate);
 
-    _mqttSub = svc.messages().listen((msg) {
-      // DEBUG: if you want, uncomment:
-      // print('MQTT MSG: $msg');
+            final exists = requests.any((r) => r.id == id);
+            if (!exists) {
+              requests.insert(0, req);
+              _requestStream.add(req);
+              notifyListeners();
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: sb.PostgresChangeEvent.delete,
+          schema: 'public',
+          table: 'access_requests',
+          callback: (payload) {
+            final oldRow = payload.oldRecord;
+            final id = oldRow['id']?.toString();
+            if (id == null) return;
 
-      if (msg['topic'] != topicRequests) return;
+            requests.removeWhere((r) => r.id == id);
+            notifyListeners();
+          },
+        );
 
-      final j = msg['json'];
-      if (j == null) return;
-
-      final cmd = (j['cmd'] ?? '').toString().toUpperCase();
-      if (cmd != 'REQUEST') return;
-
-      final plate = (j['plate'] ?? '').toString();
-      if (plate.isEmpty) return;
-
-      final req = AccessRequest(
-        id: 'mqtt_${DateTime.now().millisecondsSinceEpoch}',
-        time: DateTime.now(),
-        plate: plate,
-      );
-
-      // keep newest on top
-      requests.insert(0, req);
-      _requestStream.add(req);
-      notifyListeners();
-    });
-
-    _mqtt = svc;
+    await _reqChannel!.subscribe();
   }
 
-  void stopMqtt() {
-    _mqttSub?.cancel();
-    _mqttSub = null;
-    _mqtt?.disconnect();
-    _mqtt = null;
+  Future<void> stopRequestsRealtime() async {
+    _realtimeStarted = false;
+    final ch = _reqChannel;
+    _reqChannel = null;
+    if (ch != null) {
+      await supabase.removeChannel(ch);
+    }
   }
+
+  // ============================================================
 
   void startAutoRefresh() {
     _refreshTimer?.cancel();
     _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
-      // NOTE: we intentionally do NOT call loadRequests() here,
-      // because it would overwrite/erase MQTT-live requests.
       await Future.wait([
         loadPlates(),
         loadEvents(),
@@ -313,17 +237,24 @@ class AppState extends ChangeNotifier {
   Future<bool> login(String username, String password) async {
     await Future.delayed(const Duration(milliseconds: 250));
     final ok = (username == 'admin' && password == 'admin');
-    if (ok) {
-      currentUser = const AppUser('admin', isAdmin: true);
-      await loadAll();
-      startAutoRefresh();
-      notifyListeners();
-    }
-    return ok;
+    if (!ok) return false;
+
+    currentUser = const AppUser('admin', isAdmin: true);
+
+    await loadAll();
+    startAutoRefresh();
+
+    try {
+      await startRequestsRealtime();
+    } catch (_) {}
+
+    notifyListeners();
+    return true;
   }
 
   void logout() {
     stopAutoRefresh();
+    stopRequestsRealtime();
     currentUser = null;
     notifyListeners();
   }
@@ -332,8 +263,7 @@ class AppState extends ChangeNotifier {
     await Future.wait([
       loadPlates(),
       loadEvents(),
-      // If you still want DB requests in addition to MQTT requests,
-      // call loadRequests() manually from a button later.
+      loadRequests(), // initial request list
     ]);
   }
 
@@ -398,28 +328,22 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Optional: keep your DB requests if you still need them
   Future<void> loadRequests() async {
     final data = await supabase
         .from('access_requests')
         .select()
         .order('request_time', ascending: false);
 
-    final loaded = data.map<AccessRequest>((row) {
-      final rt = row['request_time'];
-      return AccessRequest(
-        id: row['id'].toString(),
-        time: DateTime.parse(rt.toString()),
-        plate: row['plate'] as String,
-      );
-    }).toList();
-
-    // merge DB requests into list without deleting MQTT ones
-    final mqttOnes = requests.where((r) => r.id.startsWith('mqtt_')).toList();
     requests
       ..clear()
-      ..addAll(mqttOnes)
-      ..addAll(loaded);
+      ..addAll(data.map<AccessRequest>((row) {
+        final rt = row['request_time'];
+        return AccessRequest(
+          id: row['id'].toString(),
+          time: DateTime.parse(rt.toString()),
+          plate: row['plate'] as String,
+        );
+      }));
 
     notifyListeners();
   }
@@ -494,41 +418,27 @@ class AppState extends ChangeNotifier {
     });
 
     if (!isAllowed) {
-      final data = await supabase
-          .from('access_requests')
-          .insert({'plate': normalized})
-          .select()
-          .single();
+      await supabase.from('access_requests').insert({'plate': normalized});
 
       await supabase.from('access_events').insert({
         'plate': normalized,
         'action': 'request_created',
         'by_user': by,
       });
-
-      final rt = data['request_time'];
-      final req = AccessRequest(
-        id: data['id'].toString(),
-        time: DateTime.parse(rt.toString()),
-        plate: data['plate'] as String,
-      );
-
-      requests.insert(0, req);
-      _requestStream.add(req);
     }
 
     await loadEvents();
-    await loadRequests();
+    await loadRequests(); // optional safety
     notifyListeners();
   }
 
   Future<void> approveRequest(AccessRequest req, {required String by}) async {
-    // MQTT open command
-    _mqtt?.publishJson(topicCmd, {
-      'cmd': 'OPEN',
+    // write command to DB
+    await supabase.from('gate_commands').insert({
+      'command': 'open',
       'plate': req.plate,
-      'by': by,
-      'ts': DateTime.now().toIso8601String(),
+      'by_user': by,
+      'created_at': DateTime.now().toUtc().toIso8601String(),
     });
 
     await supabase.from('access_events').insert({
@@ -537,22 +447,20 @@ class AppState extends ChangeNotifier {
       'by_user': by,
     });
 
-    if (!req.id.startsWith('mqtt_')) {
-      final idInt = int.tryParse(req.id);
-      await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
-    }
+    // delete request row (UI will update via realtime delete)
+    final idInt = int.tryParse(req.id);
+    await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
 
-    requests.removeWhere((r) => r.id == req.id);
     await loadEvents();
     notifyListeners();
   }
 
   Future<void> denyRequest(AccessRequest req, {required String by}) async {
-    _mqtt?.publishJson(topicCmd, {
-      'cmd': 'CLOSE',
+    await supabase.from('gate_commands').insert({
+      'command': 'close',
       'plate': req.plate,
-      'by': by,
-      'ts': DateTime.now().toIso8601String(),
+      'by_user': by,
+      'created_at': DateTime.now().toUtc().toIso8601String(),
     });
 
     await supabase.from('access_events').insert({
@@ -561,33 +469,26 @@ class AppState extends ChangeNotifier {
       'by_user': by,
     });
 
-    if (!req.id.startsWith('mqtt_')) {
-      final idInt = int.tryParse(req.id);
-      await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
-    }
+    final idInt = int.tryParse(req.id);
+    await supabase.from('access_requests').delete().eq('id', idInt ?? req.id);
 
-    requests.removeWhere((r) => r.id == req.id);
     await loadEvents();
     notifyListeners();
   }
 
   Future<void> sendGateCommand(String command, {required String by}) async {
-    _mqtt?.publishJson(topicCmd, {
-      'cmd': command.toLowerCase() == 'open' ? 'OPEN' : 'CLOSE',
-      'plate': 'ADMIN',
-      'by': by,
-      'ts': DateTime.now().toIso8601String(),
-    });
+    final cmd = command.toLowerCase() == 'open' ? 'open' : 'close';
 
     await supabase.from('gate_commands').insert({
-      'command': command,
+      'command': cmd,
+      'plate': 'ADMIN',
       'by_user': by,
       'created_at': DateTime.now().toUtc().toIso8601String(),
     });
 
     await supabase.from('access_events').insert({
       'plate': 'ADMIN',
-      'action': 'gate_$command',
+      'action': 'gate_$cmd',
       'by_user': by,
     });
 
@@ -598,7 +499,7 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     stopAutoRefresh();
-    stopMqtt();
+    stopRequestsRealtime();
     _requestStream.close();
     super.dispose();
   }
@@ -621,15 +522,6 @@ class _GateAppState extends State<GateApp> {
   void initState() {
     super.initState();
     theme.load();
-
-    // START MQTT IMMEDIATELY (even before login)
-    Future.microtask(() async {
-      try {
-        await state.startMqtt();
-      } catch (_) {
-        // ignore; app still works (Supabase features still work)
-      }
-    });
   }
 
   @override
